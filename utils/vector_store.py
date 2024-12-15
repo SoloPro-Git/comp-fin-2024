@@ -10,6 +10,18 @@ from tqdm import tqdm
 
 class VectorStore:
     def __init__(self):
+        # 自定义关键词列表
+        self.custom_keywords = [
+            "董秘",  # 示例关键词
+            "会计师事务所",     # 示例关键词
+            "法律顾问"  # 示例关键词
+            # 你可以继续添加更多的关键词
+        ]
+        
+        # 添加自定义关键词到jieba
+        for keyword in self.custom_keywords:
+            jieba.add_word(keyword)
+
         self.api_key = self._load_api_key()
         self.api_url = "https://api.siliconflow.cn/v1/embeddings"
         self.rerank_url = "https://api.siliconflow.cn/v1/rerank"
@@ -40,12 +52,14 @@ class VectorStore:
     def _init_faiss_index(self):
         """初始化FAISS索引"""
         quantizer = faiss.IndexFlatIP(self.embedding_size)
-        nlist = 100  # 聚类中心数量，可以根据数据规模调整
+        nlist = 30  # 聚类中心数量可以根据数据规模调整
         self.index = faiss.IndexIVFFlat(quantizer, self.embedding_size, nlist, faiss.METRIC_INNER_PRODUCT)
     
     def _normalize_vectors(self, vectors):
         """归一化向量，用于余弦相似度计算"""
-        return vectors / np.linalg.norm(vectors, axis=1)[:, np.newaxis]
+        norm = np.linalg.norm(vectors, axis=1)[:, np.newaxis]
+        normalized_vectors = vectors / norm
+        return normalized_vectors
     
     def get_embedding(self, text):
         headers = {
@@ -61,7 +75,8 @@ class VectorStore:
         
         response = requests.post(self.api_url, headers=headers, json=data)
         if response.status_code == 200:
-            return response.json()['data'][0]['embedding']
+            embedding = response.json()['data'][0]['embedding']
+            return embedding
         else:
             raise Exception(f"API调用失败: {response.text}")
     
@@ -92,17 +107,22 @@ class VectorStore:
     def _load_vector_store(self):
         """从本地加载向量存储"""
         try:
-            # 加载文档和分词结果
-            with open(os.path.join(self.vector_store_dir, 'documents.pkl'), 'rb') as f:
-                data = pickle.load(f)
-                documents = data['documents']
-                tokenized_documents = data['tokenized']
+            # 尝试加载文档和分词结果
+            try:
+                with open(os.path.join(self.vector_store_dir, 'documents.pkl'), 'rb') as f:
+                    data = pickle.load(f)
+                    documents = data['documents']
+                    tokenized_documents = data['tokenized']
+            except (FileNotFoundError, EOFError):
+                documents, tokenized_documents = None, None
             
             # 加载FAISS索引
-            self.index = faiss.read_index(os.path.join(self.vector_store_dir, 'faiss.index'))
-            
+            try:
+                self.index = faiss.read_index(os.path.join(self.vector_store_dir, 'faiss.index'))
+            except (FileNotFoundError, EOFError, RuntimeError) as e:
+                raise Exception(f"加载FAISS索引失败: {str(e)}")
             return documents, tokenized_documents
-        except (FileNotFoundError, EOFError):
+        except Exception as e:
             return None, None
     
     def load_data(self):
@@ -114,6 +134,17 @@ class VectorStore:
             print("从本地向量存储加载数据...")
             self.documents = documents
             self.bm25 = BM25Okapi(tokenized_documents)
+            return              
+        if self.index is not None:
+            print("从本地向量存储加载数据...，只重建BM25索引")
+            # 从JSON文件加载数据
+            with open('data_graph/output/graph_data.json', 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # 提取所有节点的文本内容
+            for node in data['nodes']:
+                self.documents.append(str(node))
+            self.rebuild_bm25_index()
             return
         
         print("从原始数据构建向量存储...")
@@ -135,7 +166,7 @@ class VectorStore:
         
         # 准备BM25
         print("构建BM25索引...")
-        tokenized_documents = [list(jieba.cut(doc)) for doc in tqdm(self.documents, desc="分词进度")]
+        tokenized_documents = [list(jieba.cut(doc, cut_all=True)) for doc in tqdm(self.documents, desc="分词进度")]
         self.bm25 = BM25Okapi(tokenized_documents)
         
         # 保存到本地
@@ -168,6 +199,8 @@ class VectorStore:
         """混合搜索并使用重排序优化结果"""
         # 获取查询文本的向量
         query_vector = self.get_embedding(query)
+        # 将列表转换为 numpy 数组
+        query_vector = np.array(query_vector)
         
         # 归一化查询向量并使用FAISS搜索
         normalized_query = self._normalize_vectors(query_vector.reshape(1, -1))
@@ -178,31 +211,63 @@ class VectorStore:
         candidate_indices = indices[0]
         
         # 计算BM25分数
-        tokenized_query = list(jieba.cut(query))
+        tokenized_query = list(jieba.cut(query, cut_all=True))
         bm25_scores = self.bm25.get_scores(tokenized_query)
-        bm25_scores = bm25_scores[candidate_indices]  # 只取候选文档的分数
         
-        # 归一化BM25分数
-        bm25_scores = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores))
+        # 获取 BM25 相关的候选文档
+        bm25_candidate_indices = np.argsort(bm25_scores)[-rerank_candidates:]  # 取 BM25 分数最高的候选文档
+        bm25_candidate_docs = [self.documents[idx] for idx in bm25_candidate_indices]
         
-        # 组合分数
-        combined_scores = 0.7 * cosine_scores + 0.3 * bm25_scores
+        # 获取 FAISS 相关的候选文档
+        faiss_candidate_docs = [self.documents[idx] for idx in candidate_indices]
         
-        # 准备重排序的文档
-        candidate_docs = [self.documents[idx] for idx in candidate_indices]
+        # 合并候选文档
+        combined_candidate_docs = list(set(faiss_candidate_docs) | set(bm25_candidate_docs))
         
         # 使用重排序API优化结果
-        reranked_results = self.rerank_results(query, candidate_docs, top_k)
+        reranked_results = self.rerank_results(query, combined_candidate_docs, top_k)
         
         # 格式化最终结果
         results = []
         for result in reranked_results:
-            idx = candidate_indices[result['index']]
+            # 找到文档的原始索引
+            doc_text = result['document']['text']
+            idx = self.documents.index(doc_text)
+            
+            # 获取 FAISS 和 BM25 分数
+            vector_score = 0
+            bm25_score = 0
+            
+            if doc_text in faiss_candidate_docs:
+                faiss_index = faiss_candidate_docs.index(doc_text)
+                vector_score = float(cosine_scores[faiss_index])  # 从 FAISS 得到的分数
+            
+            if doc_text in bm25_candidate_docs:
+                bm25_index = bm25_candidate_docs.index(doc_text)
+                bm25_score = float(bm25_scores[bm25_candidate_indices[bm25_index]])  # 从 BM25 得到的分数
+            
             results.append({
-                'text': result['document']['text'],
-                'score': float(result['relevance_score']),
-                'vector_score': float(cosine_scores[result['index']]),
-                'bm25_score': float(bm25_scores[result['index']])
+                'text': doc_text,
+                'score': float(result['relevance_score']),  # 重排序模型的分数
+                'vector_score': vector_score,
+                'bm25_score': bm25_score
             })
         
         return results
+    
+    def rebuild_bm25_index(self):
+        """重新构建 BM25 索引"""
+        print("重新构建 BM25 索引...")
+        # 使用 cut_all=True 进行全模式分词
+        tokenized_documents = [list(jieba.cut(doc, cut_all=True)) for doc in tqdm(self.documents, desc="分词进度")]
+        self.bm25 = BM25Okapi(tokenized_documents)
+        
+        # 更新保存的分词结果
+        self._ensure_vector_store_dir()
+        with open(os.path.join(self.vector_store_dir, 'documents.pkl'), 'wb') as f:
+            pickle.dump({
+                'documents': self.documents, 
+                'tokenized': tokenized_documents
+            }, f)
+        
+        print("BM25 索引重建完成！")

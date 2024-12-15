@@ -3,6 +3,7 @@ from utils.vector_store import VectorStore
 def main():
     # 初始化向量存储
     vector_store = VectorStore()
+    # vector_store.rebuild_bm25_index()
     
     # 测试查询
     query = "600872的全称、A股简称、法人、法律顾问、会计师事务所及董秘是？"
