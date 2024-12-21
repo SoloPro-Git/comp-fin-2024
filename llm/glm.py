@@ -45,7 +45,8 @@ class GLM:
         # 调用 API 获取回复
         response = self.client.chat.completions.create(
             messages=messages,
-            model=self.model
+            model=self.model,
+            temperature=0,
         )
         
         # 获取回复内容

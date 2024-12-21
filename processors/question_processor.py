@@ -5,6 +5,7 @@ sys.path.append(os.getcwd())
 from llm.glm import GLM
 from data_graph.config import VALID_SOURCE_FIELDS
 import pandas as pd
+from data_graph.find_shortest_path import load_graph, find_all_paths
 
 def load_api_key():
     """从apikey文件加载API密钥"""
@@ -32,6 +33,8 @@ class QuestionProcessor:
         self.vector_store = VectorStore()
         # 加载数据字典
         self.data_dict = self._load_data_dictionary()
+        # 加载图数据
+        self.G = load_graph()
 
     def _load_graph_data(self):
         """加载图数据"""
@@ -76,37 +79,42 @@ class QuestionProcessor:
             print(f"加载数据字典时发生错误: {str(e)}")
             return {}
 
-    def _analyze_question(self, question):
+    def _extract_entities_from_question(self, question):
         """
-        分析问题中的关键字段
+        从问题中提取实体信息
+        Args:
+            question: 用户提出的问题
         Returns:
             dict: {
-                'has_valid_fields': bool,  # 是否包含有效字段
-                'found_fields': list,      # 找到的有效字段列表
-                'nodes_exist': bool,       # 字段是否存在于图数据中
-                'found_nodes': list        # 在图数据中找到的节点
+                'has_valid_entities': bool,  # 是否包含有效实体
+                'found_entities': list,      # 找到的有效实体列表
+                'nodes_exist': bool,         # 实体是否存在于图数据中
+                'found_nodes': list          # 在图数据中找到的节点
+                'analysis': str              # 分析说明
             }
         """
-        # 获取所有节点的字段名称
-        node_fields = set()
-        for node in self.graph_data.get('nodes', []):
-            node_name = str(node)
-            if node_name:
-                node_fields.add(node_name)
-        
         # 构提示词
         prompt = f"""
-        请分析以下问题中是否包含这些字段：
-        1. 实体字段列表：{', '.join(self.valid_fields)}
-        2. 查询数据字段：{', '.join(node_fields)}
+        请分析以下问题中是否包含这些实体字段：
+        实体字段列表：{', '.join(self.valid_fields)}
 
         问题：{question}
+        实体字段的一些样例格式为：
+        ###
+            '公司名称': 'XXX实业',
+            '公司代码': '6008XX',           # 公司唯一标识
+            '证券代码': '',           # 证券唯一标识
+            '证券内部编码': '',        # 证券内部唯一标标识
+            'JSID': '',             # 聚源数据标识
+            'RID': '',              # 关系标识符
+    
+        ###
+
         
         请直接返回JSON格式数据（不要包含其他标记），格式如下：
         {{
             "analysis": "分析说明：解释为什么认为问题包含这些字段",
-            "实体字段列表": {{"字段1": "实体1", "字段2": "实体2"}},
-            "查询数据字段": ["字段1", "字段2"]
+            "实体字段列表": {{"字段1": "实体1", "字段2": "实体2"}}
         }}
         """
         
@@ -126,38 +134,32 @@ class QuestionProcessor:
             entity_fields = result.get('实体字段列表', {})
             if isinstance(entity_fields, list):
                 # 处理 ["字段1:实体1", "字段2:实体2"] 格式
-                found_valid_fields = []
+                found_valid_entities = []
                 for item in entity_fields:
                     if isinstance(item, str) and ':' in item:
                         field, entity = item.split(':', 1)
-                        found_valid_fields.append({field.strip(): entity.strip()})
+                        found_valid_entities.append({field.strip(): entity.strip()})
                     else:
-                        found_valid_fields.append(item)
+                        found_valid_entities.append(item)
             elif isinstance(entity_fields, dict):
                 # 处理 {"字段1": "实体1", "字段2": "实体2"} 格式
-                found_valid_fields = [{k: v} for k, v in entity_fields.items()]
+                found_valid_entities = [{k: v} for k, v in entity_fields.items()]
             else:
-                found_valid_fields = []
+                found_valid_entities = []
 
-            # 处理查询数据字段
-            found_node_fields = result.get('查询数据字段', [])
-            
-            # 检查字段是否存在于图数据中
-            confirmed_nodes = [node for node in found_node_fields if node in node_fields]
-            
             return {
-                'has_valid_fields': bool(found_valid_fields),
-                'found_fields': found_valid_fields,
-                'nodes_exist': bool(confirmed_nodes),
-                'found_nodes': confirmed_nodes,
+                'has_valid_entities': bool(found_valid_entities),
+                'found_entities': found_valid_entities,
+                'nodes_exist': False,  # 暂时设为 False
+                'found_nodes': [],     # 暂时为空列表
                 'analysis': result.get('analysis', '')
             }
         except json.JSONDecodeError as e:
             print(f"警告：模型返回的JSON格式无效: {reply}")
             print(f"错误详情: {str(e)}")
             return {
-                'has_valid_fields': False,
-                'found_fields': [],
+                'has_valid_entities': False,
+                'found_entities': [],
                 'nodes_exist': False,
                 'found_nodes': [],
                 'analysis': ''
@@ -299,6 +301,229 @@ class QuestionProcessor:
         
         return unique_table_names
 
+    def find_graph_paths_for_entities_and_terms(self, entities_analysis, relevant_terms, max_paths_per_term=3):
+        """
+        为实体和相关词语查找图中的路径
+        
+        Args:
+            entities_analysis: 实体分析结果
+            relevant_terms: 相关词语列表
+            max_paths_per_term: 每个词语返回的最大路径数
+        
+        Returns:
+            dict: 包含所有路径查找结果的字典
+        """
+        # 存储所有路径查找结果
+        graph_paths_results = {}
+        
+        # 遍历每个主实体
+        for main_entity_dict in entities_analysis['found_entities']:
+            for main_entity_field, main_entity_value in main_entity_dict.items():
+                print(f"\n主实体字段: {main_entity_field}")
+                
+                # 为当前主实体创建结果列表
+                graph_paths_results[main_entity_field] = {}
+                
+                # 遍历相关词语
+                for term in relevant_terms:
+                    try:
+                        # 查找从主实体到相关词语的最短路径
+                        path_result = find_all_paths(self.G, start_node=main_entity_field, end_node=term['text'], cutoff=5)
+                        
+                        print(f"\n从 {main_entity_field} 到 {term['text']} 的路径:")
+                        if 'error' in path_result:
+                            print(f"错误: {path_result['error']}")
+                            graph_paths_results[main_entity_field][term['text']] = {'error': path_result['error']}
+                        else:
+                            # 按路径长度排序
+                            sorted_paths = sorted(path_result['paths'], key=lambda x: x['length'])
+                            
+                            # 限制返回的路径数量
+                            limited_paths = sorted_paths[:max_paths_per_term]
+                            
+                            print(f"找到 {path_result['total_paths_found']} 条路径，返回最短的 {len(limited_paths)} 条")
+                            
+                            # 存储路径详情
+                            graph_paths_results[main_entity_field][term['text']] = {
+                                'total_paths_found': path_result['total_paths_found'],
+                                'paths': []
+                            }
+                            
+                            for i, path_info in enumerate(limited_paths, 1):
+                                print(f"\n路径 {i} (长度: {path_info['length']} 跳):")
+                                detailed_path = []
+                                for step in path_info['detailed_path']:
+                                    print(f"  {step['from']} --[{step['relation']}]--> {step['to']}")
+                                    detailed_path.append({
+                                        'from': step['from'],
+                                        'to': step['to'],
+                                        'relation': step['relation']
+                                    })
+                                
+                                graph_paths_results[main_entity_field][term['text']]['paths'].append({
+                                    'length': path_info['length'],
+                                    'detailed_path': detailed_path
+                                })
+                
+                    except Exception as e:
+                        print(f"查找路径时发生错误: {str(e)}")
+                        graph_paths_results[main_entity_field][term['text']] = {'error': str(e)}
+        
+        return graph_paths_results
+
+    def extract_graph_paths_details(self, graph_paths):
+        """
+        提取图路径的详细信息和文本结果
+        
+        Args:
+            graph_paths: find_graph_paths_for_entities_and_terms 返回的路径结果
+        
+        Returns:
+            dict: 包含路径结果字符串、涉及的表名和详细信息
+        """
+        # 存储所有涉及的节点和关系（可能的表名）
+        all_nodes = set()
+        all_relations = set()
+        
+        # 存储路径结果的字符串表示
+        paths_str = []
+        
+        # 存储路径的详细信息（用于传递给LLM）
+        paths_details = []
+        
+        # 遍历路径结果
+        for main_entity, term_paths in graph_paths.items():
+            main_entity_paths = []
+            paths_str.append(f"主实体: {main_entity}")
+            
+            for term, path_info in term_paths.items():
+                term_entity_paths = {
+                    'target_term': term,
+                    'paths': []
+                }
+                
+                paths_str.append(f"  目标词语: {term}")
+                
+                if 'error' in path_info:
+                    paths_str.append(f"    错误: {path_info['error']}")
+                    term_entity_paths['error'] = path_info['error']
+                else:
+                    paths_str.append(f"    找到 {path_info['total_paths_found']} 条路径")
+                    
+                    for i, path in enumerate(path_info['paths'], 1):
+                        path_str = f"    路径 {i} (长度: {path['length']} 跳):"
+                        paths_str.append(path_str)
+                        
+                        detailed_path = []
+                        path_steps = []
+                        for step in path['detailed_path']:
+                            step_str = f"      {step['from']} --[{step['relation']}]--> {step['to']}"
+                            paths_str.append(step_str)
+                            
+                            # 收集所有节点和关系
+                            all_nodes.add(step['from'])
+                            all_nodes.add(step['to'])
+                            all_relations.add(step['relation'])
+                            
+                            # 记录路径步骤
+                            path_steps.append({
+                                'from': step['from'],
+                                'to': step['to'],
+                                'relation': step['relation']
+                            })
+                        
+                        term_entity_paths['paths'].append({
+                            'length': path['length'],
+                            'steps': path_steps
+                        })
+                    
+                    main_entity_paths.append(term_entity_paths)
+            
+            paths_details.append({
+                'main_entity': main_entity,
+                'term_paths': main_entity_paths
+            })
+        
+        # 移除可能的空节点和关系
+        all_nodes = {node for node in all_nodes if node}
+        all_relations = {relation for relation in all_relations if relation}
+        
+        # 使用 find_table_details_from_table_names 查找表详细信息
+        # 将 all_relations 转换为唯一的表名列表
+        unique_table_names = list(all_relations)
+        
+        # 查找表的详细信息
+        table_details = self.find_table_details_from_table_names(unique_table_names)
+        
+        # 打印表详情
+        print("\n路径中涉及的表详细信息:")
+        for node, detail in table_details.items():
+            print(f"节点: {node}")
+            print(f"  - 表名(中文): {detail['table_name_cn']}")
+            print(f"  - 表名(英文): {detail['table_name_en']}")
+            print(f"  - 所属数据库(中文): {detail['database_cn']}")
+            print(f"  - 所属数据库(英文): {detail['database_en']}")
+            print("---")
+        
+        return {
+            'paths_str': '\n'.join(paths_str),
+            'paths_details': paths_details,
+            'table_details': table_details
+        }
+
+    def find_table_columns_info(self, unique_table_names):
+        """
+        在"表字段信息"sheet中查找指定表的字段信息
+        
+        Args:
+            unique_table_names: 要查找的表名列表
+        
+        Returns:
+            dict: 表名对应的字段信息
+        """
+        # 存储表的字段信息
+        table_columns_info = {}
+        
+        # 确保存在"表字段信息"sheet
+        if '表字段信息' not in self.data_dict:
+            print("未找到表字段信息sheet")
+            return table_columns_info
+        
+        # 获取"表字段信息"sheet的DataFrame
+        table_fields_df = self.data_dict['表字段信息']['df']
+        
+        # 遍历每个表名
+        for table_name in unique_table_names:
+            # 在表字段信息中查找匹配的行
+            matching_rows = table_fields_df[
+                table_fields_df['table_name'].astype(str) == table_name
+            ]
+            
+            # 如果找到匹配行
+            if not matching_rows.empty:
+                # 提取字段信息
+                columns_info = []
+                for _, row in matching_rows.iterrows():
+                    column_info = {
+                        'column_name': row.get('column_name', ''),
+                        'column_description': row.get('column_description', '')
+                    }
+                    columns_info.append(column_info)
+                
+                # 存储该表的字段信息
+                table_columns_info[table_name] = columns_info
+        
+        # 打印表字段信息
+        print("\n表字段详细信息:")
+        for table, columns in table_columns_info.items():
+            print(f"表名: {table}")
+            for column in columns:
+                print(f"  - 字段名: {column['column_name']}")
+                print(f"    描述: {column['column_description']}")
+            print("---")
+        
+        return table_columns_info
+
     def process_question(self, qa, messages):
         """
         处理单个问题
@@ -314,26 +539,53 @@ class QuestionProcessor:
         print(f"\n问题ID: {question_id}")
         print(f"用户: {question}")
         
-        # 新增：获取相关词语
+        # 获取问题中可能匹配的客体
         relevant_terms = self.get_relevant_terms(question)
+               
+        # 提取问题中的实体信息
+        entities_analysis = self._extract_entities_from_question(question)
+        print("\n实体提取结果:")
+        print(f"包含有效实体: {entities_analysis['has_valid_entities']}")
+        print(f"找到的有效实体: {entities_analysis['found_entities']}")
         
-        # 查找相关词语对应的表名
-        table_matches = self.find_table_names_for_terms(relevant_terms)
+        # 查找图中的路径
+        graph_paths = self.find_graph_paths_for_entities_and_terms(entities_analysis, relevant_terms)
         
-        # 提取所有表名
-        unique_table_names = self.extract_table_names_from_matches(table_matches)
+        # 提取图路径详细信息
+        processed_paths = self.extract_graph_paths_details(graph_paths)
         
-        # 查找表的详细信息
-        table_details = self.find_table_details_from_table_names(unique_table_names)
+        # 获取路径中涉及的表的字段信息
+        table_columns_info = self.find_table_columns_info(list(processed_paths['table_details'].keys()))
         
-        # 分析问题
-        analysis = self._analyze_question(question)
-        print("\n问题分析结果:")
-        print(f"包含有效字段: {analysis['has_valid_fields']}")
-        print(f"找到的有效字段: {analysis['found_fields']}")
-        print(f"包含图数据字段: {analysis['nodes_exist']}")
-        print(f"找到的图数据节点: {analysis['found_nodes']}")
-        print(f"分析说明: {analysis['analysis']}")
+        # 可以进一步处理 processed_paths
+        print("\n路径结果:")
+        print(processed_paths['paths_str'])
+        
+        # 准备传递给LLM的提示词
+        paths_details_prompt = json.dumps(processed_paths['paths_details'], ensure_ascii=False, indent=2)
+        table_details_prompt = json.dumps(processed_paths['table_details'], ensure_ascii=False, indent=2)
+        table_columns_prompt = json.dumps(table_columns_info, ensure_ascii=False, indent=2)
+        
+        # 构建LLM提示词
+        llm_prompt = f"""
+        根据以下图路径分析、表详细信息和表字段信息，回答原始问题：
+
+        图路径详情：
+        {paths_details_prompt}
+
+        涉及表详情：
+        {table_details_prompt}
+
+        表字段信息：
+        {table_columns_prompt}
+
+        原始问题：{question}
+
+        请根据路径、表信息和字段信息，尽可能详细地回答问题。
+        """
+        
+        # 可以在这里调用LLM生成最终答案
+        # reply, messages = self.glm.chat(llm_prompt, messages)
         
         return messages
 
@@ -346,7 +598,7 @@ class QuestionProcessor:
             list: 相关词语列表及其得分
         """
         try:
-            # 使用hybrid_search进行多路召回
+            # 使用hybrid_search进行路召回
             search_results = self.vector_store.hybrid_search(question, top_k=5)
             
             # 格式化搜索结果
@@ -370,7 +622,7 @@ class QuestionProcessor:
             return relevant_terms
             
         except Exception as e:
-            print(f"获取相关词语时发生错误: {str(e)}")
+            print(f"获取相关词语时生错误: {str(e)}")
             return []
 
 def test_question_processor():
@@ -401,4 +653,4 @@ def test_question_processor():
     #     print(f"测试过程中发生错误: {str(e)}")
 
 if __name__ == "__main__":
-    test_question_processor() 
+    test_question_processor()
