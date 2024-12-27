@@ -6,6 +6,9 @@ from llm.glm import GLM
 from data_graph.config import VALID_SOURCE_FIELDS
 import pandas as pd
 from data_graph.find_shortest_path import load_graph, find_all_paths
+from utils.sql_request import SQLQueryClient
+from utils.gen_full_schema_table_relation import generate_table_full_name_dict
+import re
 
 def load_api_key():
     """从apikey文件加载API密钥"""
@@ -23,9 +26,77 @@ class QuestionProcessor:
         """
         初始化问题处理器
         Args:
-            glm_model: GLM模型实例
+            glm_model: 主GLM模型实例
         """
         self.glm = glm_model
+        self.table_full_name_dict = generate_table_full_name_dict()
+        
+        # 为实体提取创建专门的大模型实例
+        self.entity_extraction_model = GLM(
+            api_key=load_api_key(), 
+            model="glm-4-air"
+        )
+        
+        # 为SQL生成创建专门的大模型实例
+        self.sql_generation_model = GLM(
+            api_key=load_api_key(), 
+            model="glm-4-air"
+        )
+        
+        # 实体提取的系统提示词
+        self.entity_extraction_system_prompt = """
+        你是一个专业的金融数据实体提取专家，擅长从复杂的金融问题中精确提取关键实体信息。
+        你的任务是识别问题中的具体实体字段和对应的值。
+
+        工作原则：
+        1. 仔细分析问题的语义和结构
+        2. 准确识别问题中涉及的实体字段
+        3. 提取实体字段对应的具体值
+        4. 保持高度的准确性和一致性
+        5. 如果无法确定，给出清晰的分析说明
+
+        实体提取注意事项：
+        - 关注金融领域的特定实体类型
+        - 处理各种可能的表达方式
+        - 区分不同类型的实体标识符
+        - 保持对上下文的敏感性
+
+        输出要求：
+        1. 使用标准化的JSON格式
+        2. 包含实体字段及其对应的值
+        3. 提供简要的分析说明
+        4. 确保输出的完整性和准确性
+        """
+        
+        # SQL生成的系统提示词
+        self.sql_generation_system_prompt = """
+        你是一个专业的金融数据分析SQL专家，擅长根据复杂的问题和数据关系生成精确的SQL查询。
+        你的任务是通过分析图路径、表关系和字段信息，为金融领域的复杂问题构建准确的SQL查询。
+
+        工作原则：
+        1. 仔细分析问题的具体信息需求
+        2. 利用提供的图路径和表关系信息选择最合适的连接方式
+        3. 确保SQL查询能精确回答问题
+        4. 注意处理可能的多表关联和复杂条件
+        5. 优先选择最短、最直接的查询路径
+        6. 返回的SQL应当简洁、高效、易读
+
+        SQL编写注意事项：
+        - 使用标准MySQL语法
+        - 优先使用LEFT JOIN
+        - 在WHERE子句中添加必要的过滤条件
+        - 使用明确的字段选择
+        - 避免不必要的子查询
+        - 考虑性能和可读性
+
+        输出要求：
+        1. 每个子问题对应一个精确的SQL查询
+        2. 包含子问题描述
+        3. 列出涉及的表
+        4. 说明返回的字段
+        5. 确保查询逻辑清晰且易于理解
+        """
+        
         self.graph_data = self._load_graph_data()
         self.valid_fields = self._load_valid_fields()
         # 初始化向量存储
@@ -35,6 +106,7 @@ class QuestionProcessor:
         self.data_dict = self._load_data_dictionary()
         # 加载图数据
         self.G = load_graph()
+        self.sql_query_client = SQLQueryClient()
 
     def _load_graph_data(self):
         """加载图数据"""
@@ -82,18 +154,15 @@ class QuestionProcessor:
     def _extract_entities_from_question(self, question):
         """
         从问题中提取实体信息
-        Args:
-            question: 用户提出的问题
-        Returns:
-            dict: {
-                'has_valid_entities': bool,  # 是否包含有效实体
-                'found_entities': list,      # 找到的有效实体列表
-                'nodes_exist': bool,         # 实体是否存在于图数据中
-                'found_nodes': list          # 在图数据中找到的节点
-                'analysis': str              # 分析说明
-            }
         """
-        # 构提示词
+        # 准备消息列表并设置系统提示词
+        messages = []
+        messages = self.entity_extraction_model.set_system_prompt(
+            self.entity_extraction_system_prompt, 
+            messages
+        )
+        
+        # 构建提示词（保持原有逻辑）
         prompt = f"""
         请分析以下问题中是否包含这些实体字段：
         实体字段列表：{', '.join(self.valid_fields)}
@@ -102,15 +171,14 @@ class QuestionProcessor:
         实体字段的一些样例格式为：
         ###
             '公司名称': 'XXX实业',
-            '公司代码': '6008XX',           # 公司唯一标识
+            '证券代码': '6008XX',           # 公司唯一标识
             '证券代码': '',           # 证券唯一标识
-            '证券内部编码': '',        # 证券内部唯一标标识
+            '证券内部编码': '',        # 证券内部唯一标识
             'JSID': '',             # 聚源数据标识
             'RID': '',              # 关系标识符
     
         ###
 
-        
         请直接返回JSON格式数据（不要包含其他标记），格式如下：
         {{
             "analysis": "分析说明：解释为什么认为问题包含这些字段",
@@ -118,19 +186,14 @@ class QuestionProcessor:
         }}
         """
         
-        # 获取模型回答
-        reply, _ = self.glm.chat(prompt, [])
+        # 使用专门的实体提取模型
+        reply, _ = self.entity_extraction_model.chat(prompt, messages)
         
+        # 解析JSON（保持原有逻辑）
         try:
-            # 清理回答中的可能干扰 JSON 解析的内容
-            reply = reply.strip()
-            if reply.startswith('```'):
-                reply = reply[reply.find('{'):reply.rfind('}')+1]
+            result = self.parse_llm_json(reply, default_return={})
             
-            # 解析模型回答
-            result = json.loads(reply)
-            
-            # 处理实体字段列表（兼容两种格式）
+            # 处理实体字段列表（保持原有逻辑）
             entity_fields = result.get('实体字段列表', {})
             if isinstance(entity_fields, list):
                 # 处理 ["字段1:实体1", "字段2:实体2"] 格式
@@ -154,9 +217,8 @@ class QuestionProcessor:
                 'found_nodes': [],     # 暂时为空列表
                 'analysis': result.get('analysis', '')
             }
-        except json.JSONDecodeError as e:
-            print(f"警告：模型返回的JSON格式无效: {reply}")
-            print(f"错误详情: {str(e)}")
+        except Exception as e:
+            print(f"实体提取失败: {str(e)}")
             return {
                 'has_valid_entities': False,
                 'found_entities': [],
@@ -261,6 +323,7 @@ class QuestionProcessor:
                         'table_name_en': row.get('表英文', ''),
                         'database_en': row.get('库名英文', ''),
                         'database_cn': row.get('库名中文', ''),
+                        'table_details': row.get('表描述', '')
                     }
                     table_details[table_name] = row_details
         
@@ -301,7 +364,7 @@ class QuestionProcessor:
         
         return unique_table_names
 
-    def find_graph_paths_for_entities_and_terms(self, entities_analysis, relevant_terms, max_paths_per_term=3):
+    def find_graph_paths_for_entities_and_terms(self, entities_analysis, relevant_terms, max_paths_per_term=5):
         """
         为实体和相关词语查找图中的路径
         
@@ -320,6 +383,10 @@ class QuestionProcessor:
         for main_entity_dict in entities_analysis['found_entities']:
             for main_entity_field, main_entity_value in main_entity_dict.items():
                 print(f"\n主实体字段: {main_entity_field}")
+                
+                # 当为 ‘公司名称’ 时，替换为 ‘中文名称’
+                if main_entity_field == '公司名称':
+                    main_entity_field = '中文名称'
                 
                 # 为当前主实体创建结果列表
                 graph_paths_results[main_entity_field] = {}
@@ -524,6 +591,231 @@ class QuestionProcessor:
         
         return table_columns_info
 
+    def parse_llm_json(self, reply, default_return={"queries": []}):
+        """
+        解析大模型返回的 JSON 字符串
+        
+        Args:
+            reply: 大模型返回的文本
+            default_return: 解析失败时返回的默认值
+        
+        Returns:
+            解析后的 JSON 对象
+        """
+        try:
+            # 清理和预处理回复文本
+            reply = reply.strip()
+            
+            # 移除代码块标记
+            if reply.startswith('```json'):
+                reply = reply[7:-3]
+            elif reply.startswith('```'):
+                reply = reply[3:-3]
+            
+            # 尝试解析 JSON
+            parsed_json = json.loads(reply)
+            
+            return parsed_json
+        
+        except json.JSONDecodeError as e:
+            print(f"JSON解析错误: {str(e)}")
+            print(f"原始响应: {reply}")
+            
+            # 尝试处理可能的特殊情况
+            try:
+                # 移除可能的前导/后导文本
+                start_index = reply.find('{')
+                end_index = reply.rfind('}') + 1
+                
+                if start_index != -1 and end_index != -1:
+                    cleaned_reply = reply[start_index:end_index]
+                    parsed_json = json.loads(cleaned_reply)
+                    
+                    print("\n清理后解析的JSON:")
+                    print(json.dumps(parsed_json, ensure_ascii=False, indent=2))
+                    
+                    return parsed_json
+            except Exception as clean_error:
+                print(f"清理JSON时发生错误: {str(clean_error)}")
+            
+            return default_return
+        except Exception as e:
+            print(f"解析过程中发生错误: {str(e)}")
+            return default_return
+
+    def generate_sql_queries_from_paths(self, question, processed_paths):
+        """
+        根据图路径、表信息和字段信息，生成用于回答问题的SQL查询
+        """
+        # 准备消息列表并设置系统提示词
+        messages = []
+        messages = self.sql_generation_model.set_system_prompt(
+            self.sql_generation_system_prompt, 
+            messages
+        )
+        
+        # 后续代码保持原有逻辑
+        paths_details_prompt = json.dumps(processed_paths['paths_details'], ensure_ascii=False, indent=2)
+        table_details_prompt = json.dumps(processed_paths['table_details'], ensure_ascii=False, indent=2)
+        table_columns_prompt = json.dumps(
+            self.find_table_columns_info(list(processed_paths['table_details'].keys())), 
+            ensure_ascii=False, 
+            indent=2
+        )
+        
+        # 构建LLM提示词
+        llm_prompt = f"""
+        任务：根据图路径、表信息和字段信息，为以下问题生成精确的SQL查询语句
+
+        原始问题：{question}
+
+        图路径详情：
+        {paths_details_prompt}
+
+        涉及表详情：
+        {table_details_prompt}
+
+        表字段信息：
+        {table_columns_prompt}
+
+        请按照以下要求完成任务：
+        1. 仔细分析问题中需要查询的具体信息
+        2. 根据图路径和表信息，选择合适的表和字段
+        3. 生成能够精确回答问题的SQL查询
+        4. 使用JSON格式返回，包含：
+        - 子问题描述
+        - 对应的SQL查询
+        - 涉及的表
+        - 预期返回的字段
+
+        子问题需要根据原始问题进行分解，图路径、表信息仅作参考。
+        
+        查表优先选择SecuMain、LC_AreaCode这些表。
+        原始问题提及港股才使用HK_XXX的表，提及美股才使用US_XXX的表，否则不使用HK_XXX、US_XXX的表。
+        
+        返回格式示例：
+        {{
+            "queries": [
+                {{
+                    "sub_question": "查询公司全称",
+                    "sql": "SELECT 表名.全称字段 FROM 表名 WHERE 公司代码 = 'xxx'",
+                    "involved_tables": ["表名1", "表名2"],
+                    "return_fields": ["全称", "公司代码"]
+                }},
+                // 其他子查询...
+            ]
+        }}
+        """
+        
+        try:
+            # 使用专门的SQL生成模型
+            reply, _ = self.sql_generation_model.chat(llm_prompt, messages)
+            
+            # 解析JSON
+            sql_queries = self.parse_llm_json(reply)
+            
+            # 打印生成的SQL查询
+            print("\n生成的SQL查询:")
+            for query in sql_queries.get('queries', []):
+                print(f"子问题: {query.get('sub_question', '')}")
+                print(f"SQL: {query.get('sql', '')}")
+                print(f"涉及表: {query.get('involved_tables', [])}")
+                print(f"返回字段: {query.get('return_fields', [])}")
+                print("---")
+            
+            return sql_queries
+        
+        except Exception as e:
+            print(f"SQL查询生成失败: {str(e)}")
+            return {"queries": []}
+
+    def generate_final_answer(self, question, sql_queries, messages):
+        """
+        根据SQL查询结果生成最终答案
+        
+        Args:
+            question: 原始问题
+            sql_queries: 生成的SQL查询
+            messages: 对话历史
+        
+        Returns:
+            最终答案和更新后的消息历史
+        """
+        # 准备存储查询结果
+        query_results = []
+        
+        # 执行每个SQL查询
+        for query in sql_queries.get('queries', []):
+            sql = query.get('sql', '')
+            sub_question = query.get('sub_question', '')
+            
+            try:
+                # 使用 SQLQueryClient 执行查询
+                result = self.sql_query_client.execute_query(sql)
+                
+                query_results.append({
+                    'sub_question': sub_question,
+                    'sql': sql,
+                    'result': result
+                })
+            except Exception as e:
+                print(f"执行查询时发生错误: {str(e)}")
+                query_results.append({
+                    'sub_question': sub_question,
+                    'sql': sql,
+                    'error': str(e)
+                })
+        
+        # 准备提示词，让 LLM 根据查询结果生成答案
+        answer_generation_prompt = f"""
+        原始问题: {question}
+
+        SQL查询结果:
+        {json.dumps(query_results, ensure_ascii=False, indent=2)}
+
+        请根据上述查询结果，生成一个清晰、准确的回答。
+        要求:
+        1. 直接回答原始问题
+        2. 如果某些子查询出错，说明无法获取该部分信息
+        3. 保持答案的专业性和简洁性
+        """
+        
+        # 使用 GLM 模型生成最终答案
+        final_answer, updated_messages = self.glm.chat(answer_generation_prompt, messages)
+        
+        return final_answer, updated_messages
+
+    def replace_table_names_with_full_names(self, sql_queries):
+        """
+        将表名替换为完整的 schema.table 格式
+        
+        Args:
+            sql_queries (dict): 包含查询信息的字典
+        
+        Returns:
+            dict: 更新后的查询信息字典
+        """
+        for query in sql_queries['queries']:
+            updated_tables = []
+            
+            # 替换 involved_tables
+            for table in query['involved_tables']:
+                full_table_name = self.table_full_name_dict.get(table, table)
+                updated_tables.append(full_table_name)
+            query['involved_tables'] = updated_tables
+            
+            # 替换 SQL 查询中的表名
+            original_sql = query.get('sql', '')
+            updated_sql = original_sql
+            
+            for short_table_name, full_table_name in self.table_full_name_dict.items():
+                # 使用正则表达式替换，确保只替换完整的表名
+                updated_sql = re.sub(r'\b{}\b'.format(re.escape(short_table_name)), full_table_name, updated_sql)
+            
+            query['sql'] = updated_sql
+        
+        return sql_queries
+
     def process_question(self, qa, messages):
         """
         处理单个问题
@@ -553,39 +845,18 @@ class QuestionProcessor:
         
         # 提取图路径详细信息
         processed_paths = self.extract_graph_paths_details(graph_paths)
-        
-        # 获取路径中涉及的表的字段信息
-        table_columns_info = self.find_table_columns_info(list(processed_paths['table_details'].keys()))
-        
-        # 可以进一步处理 processed_paths
-        print("\n路径结果:")
-        print(processed_paths['paths_str'])
-        
-        # 准备传递给LLM的提示词
-        paths_details_prompt = json.dumps(processed_paths['paths_details'], ensure_ascii=False, indent=2)
-        table_details_prompt = json.dumps(processed_paths['table_details'], ensure_ascii=False, indent=2)
-        table_columns_prompt = json.dumps(table_columns_info, ensure_ascii=False, indent=2)
-        
-        # 构建LLM提示词
-        llm_prompt = f"""
-        根据以下图路径分析、表详细信息和表字段信息，回答原始问题：
+                
+        # 生成SQL查询
+        sql_queries = self.generate_sql_queries_from_paths(question, processed_paths)
 
-        图路径详情：
-        {paths_details_prompt}
-
-        涉及表详情：
-        {table_details_prompt}
-
-        表字段信息：
-        {table_columns_prompt}
-
-        原始问题：{question}
-
-        请根据路径、表信息和字段信息，尽可能详细地回答问题。
-        """
+        # 更新表名为schema.table格式
+        sql_queries = self.replace_table_names_with_full_names(sql_queries)
         
-        # 可以在这里调用LLM生成最终答案
-        # reply, messages = self.glm.chat(llm_prompt, messages)
+        # 根据SQL查询结果生成最终答案
+        final_answer, messages = self.generate_final_answer(question, sql_queries, messages)
+        
+        print("\n最终答案:")
+        print(final_answer)
         
         return messages
 
@@ -635,8 +906,7 @@ def test_question_processor():
         "question": "600872的全称、A股简称、法人、法律顾问、会计师事务所及董秘是？"
     }
     
-    # try:
-        # 初始化GLM模型
+    # 初始化GLM模型
     glm = GLM(api_key=GLM_API_KEY, model="glm-4-air")
     
     # 初始化问题处理器
@@ -648,9 +918,6 @@ def test_question_processor():
     messages = glm.set_system_prompt("你是一个helpful AI助手", messages)
     messages = processor.process_question(test_qa, messages)
     print("\n测试完成！")
-        
-    # except Exception as e:
-    #     print(f"测试过程中发生错误: {str(e)}")
 
 if __name__ == "__main__":
     test_question_processor()
